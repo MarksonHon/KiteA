@@ -42,7 +42,7 @@ async function handleLogin() {
   loading.value = true
   try {
     const res = await api.post('/api/auth/login', form.value)
-    auth.setAuth(res.token, res.username, res.role)
+    auth.setAuth(res)   // res is already json.data { token, username, role }
     router.push('/dashboard')
   } catch (e) {
     error.value = e.message ?? '登录失败'

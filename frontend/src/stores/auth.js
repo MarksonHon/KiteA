@@ -28,7 +28,7 @@ export const useAuthStore = defineStore('auth', () => {
 
   async function login(username, password) {
     const r = await api.post('/api/auth/login', { username, password })
-    setAuth(r.data)
+    setAuth(r)   // api.js already unwraps json.data
   }
 
   async function logout() {

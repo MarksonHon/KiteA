@@ -58,7 +58,7 @@ async function handleSetup() {
   try {
     const res = await api.post('/api/auth/setup', { username: form.value.username, password: form.value.password })
     invalidateSetupCache()   // 让路由守卫下次重新检测
-    auth.setAuth(res.token, res.username, res.role)
+    auth.setAuth(res)        // res is already { token, username, role }
     router.push('/dashboard')
   } catch (e) {
     error.value = e.message ?? '初始化失败'

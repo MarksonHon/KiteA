@@ -53,10 +53,13 @@ router.beforeEach(async (to) => {
     return needed ? true : '/login'
   }
 
-  // 访问 /login：若尚无用户则跳到初始化页
+  // 访问 /login：若尚无用户则跳到初始化页；若已登录则直接进仪表盘
   if (to.name === 'Login') {
     const needed = await isSetupNeeded()
-    return needed ? '/setup' : true
+    if (needed) return '/setup'
+    const auth2 = useAuthStore()
+    if (auth2.token) return '/dashboard'
+    return true
   }
 
   // 受保护路由：未登录时先判断是否需要初始化
