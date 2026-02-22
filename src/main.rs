@@ -23,7 +23,6 @@ use std::{
     borrow::Cow,
     env,
     path::PathBuf,
-    process::{Child, Command},
     sync::{Arc, Mutex},
 };
 use uuid::Uuid;
@@ -84,12 +83,6 @@ fn ensure_db_url() -> String {
         .unwrap_or_else(|e| warn!("Cannot create config dir {:?}: {e}", dir));
     let db_file = dir.join("kitea.db");
     format!("sqlite://{}?mode=rwc", db_file.to_string_lossy().replace('\\', "/"))
-}
-
-fn shoes_config_path() -> PathBuf {
-    env::var("KITEA_SHOES_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| default_db_path().join("shoes_runtime.yaml"))
 }
 
 // ─── database models ──────────────────────────────────────────────────────────
@@ -239,32 +232,8 @@ macro_rules! auth {
     };
 }
 
-// ─── shoes process manager ────────────────────────────────────────────────────
-struct ShoesProcess { child: Option<Child>, config_path: PathBuf, binary_path: String }
-
-impl ShoesProcess {
-    fn new(binary_path: String, config_path: PathBuf) -> Self {
-        Self { child: None, config_path, binary_path }
-    }
-    fn is_running(&mut self) -> bool {
-        self.child.as_mut().map(|c| c.try_wait().map(|s| s.is_none()).unwrap_or(false)).unwrap_or(false)
-    }
-    fn start(&mut self, yaml: &str) -> Result<()> {
-        if self.is_running() { return Err(anyhow::anyhow!("Shoes is already running")); }
-        if let Some(parent) = self.config_path.parent() { std::fs::create_dir_all(parent)?; }
-        std::fs::write(&self.config_path, yaml)?;
-        let child = Command::new(&self.binary_path).arg(&self.config_path).spawn()?;
-        info!("Shoes started (pid={})", child.id());
-        self.child = Some(child);
-        Ok(())
-    }
-    fn stop(&mut self) -> Result<()> {
-        if let Some(mut c) = self.child.take() { c.kill().ok(); c.wait().ok(); info!("Shoes stopped"); }
-        Ok(())
-    }
-}
-
-type SharedProcess = Arc<Mutex<ShoesProcess>>;
+// ─── shoes runtime (integrated library) ──────────────────────────────────────
+type ShoesRuntime = Arc<Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>>;
 
 // ─── DB init ────────────────────────────────────────────────────────────────────
 async fn db_init(pool: &SqlitePool) -> Result<()> {
@@ -289,9 +258,8 @@ async fn db_init(pool: &SqlitePool) -> Result<()> {
             key TEXT PRIMARY KEY, value TEXT NOT NULL
         );
         INSERT OR IGNORE INTO settings (key, value) VALUES
-            ('shoes_binary', 'shoes'),
-            ('local_port',   '1080'),
-            ('log_level',    'info');
+            ('local_port', '20260'),
+            ('log_level',  'info');
     "#).execute(pool).await?;
     Ok(())
 }
@@ -532,7 +500,7 @@ async fn get_settings(req: HttpRequest, pool: Data<SqlitePool>) -> impl Responde
 #[post("/api/settings")]
 async fn save_setting(req: HttpRequest, pool: Data<SqlitePool>, body: Json<SaveSettingReq>) -> impl Responder {
     let _c = auth!(req, admin);
-    let allowed = ["shoes_binary","local_port","log_level","shoes_bin","dns_server"];
+    let allowed = ["local_port","log_level","dns_server"];
     if !allowed.contains(&body.key.as_str()) { return ApiResp::<()>::err("Unknown key"); }
     let _ = sqlx::query("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)")
         .bind(&body.key).bind(&body.value).execute(pool.as_ref()).await;
@@ -543,7 +511,7 @@ async fn save_setting(req: HttpRequest, pool: Data<SqlitePool>, body: Json<SaveS
 #[put("/api/settings")]
 async fn bulk_save_settings(req: HttpRequest, pool: Data<SqlitePool>, body: Json<serde_json::Value>) -> impl Responder {
     let _c = auth!(req, admin);
-    let allowed = ["shoes_binary","shoes_bin","local_port","dns_server","log_level"];
+    let allowed = ["local_port","dns_server","log_level"];
     if let Some(map) = body.as_object() {
         for (k, v) in map {
             if !allowed.contains(&k.as_str()) { continue; }
@@ -564,38 +532,49 @@ async fn bulk_save_settings(req: HttpRequest, pool: Data<SqlitePool>, body: Json
 struct StatusResp { running: bool, pid: Option<u32>, local_port: u16, node_count: usize }
 
 #[get("/api/proxy/status")]
-async fn proxy_status(req: HttpRequest, pool: Data<SqlitePool>, process: Data<SharedProcess>) -> impl Responder {
+async fn proxy_status(req: HttpRequest, pool: Data<SqlitePool>, runtime: Data<ShoesRuntime>) -> impl Responder {
     auth!(req);
-    let mut p = process.lock().unwrap();
-    let running = p.is_running();
-    let pid = if running { p.child.as_ref().map(|c| c.id()) } else { None };
+    let running = {
+        let guard = runtime.lock().unwrap();
+        guard.as_ref().map(|h| h.iter().any(|jh| !jh.is_finished())).unwrap_or(false)
+    };
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nodes WHERE enabled=1").fetch_one(pool.as_ref()).await.unwrap_or(0);
-    let local_port: u16 = db_get_setting(pool.as_ref(), "local_port").await.parse().unwrap_or(1080);
-    ApiResp::ok(StatusResp { running, pid, local_port, node_count: count as usize })
+    let local_port: u16 = db_get_setting(pool.as_ref(), "local_port").await.parse().unwrap_or(20260);
+    ApiResp::ok(StatusResp { running, pid: None, local_port, node_count: count as usize })
 }
 
-/// Frontend sends the YAML it generated; backend writes it and starts shoes.
+/// Frontend sends YAML; backend starts the integrated shoes proxy.
 #[post("/api/proxy/start")]
-async fn proxy_start(req: HttpRequest, pool: Data<SqlitePool>, process: Data<SharedProcess>, body: Json<StartProxyReq>) -> impl Responder {
+async fn proxy_start(req: HttpRequest, pool: Data<SqlitePool>, runtime: Data<ShoesRuntime>, body: Json<StartProxyReq>) -> impl Responder {
     auth!(req);
     if body.yaml.trim().is_empty() { return ApiResp::<()>::err("YAML is empty"); }
-    let db_binary = db_get_setting(pool.as_ref(), "shoes_binary").await;
-    let local_port: u16 = db_get_setting(pool.as_ref(), "local_port").await.parse().unwrap_or(1080);
-    let mut p = process.lock().unwrap();
-    if !db_binary.is_empty() { p.binary_path = db_binary; }
-    match p.start(&body.yaml) {
-        Ok(_) => ApiResp::ok(serde_json::json!({ "message": format!("Shoes started on 127.0.0.1:{local_port}") })),
+    {
+        let guard = runtime.lock().unwrap();
+        if guard.as_ref().map(|h| h.iter().any(|jh| !jh.is_finished())).unwrap_or(false) {
+            return ApiResp::<()>::err("Proxy is already running");
+        }
+    }
+    let local_port: u16 = db_get_setting(pool.as_ref(), "local_port").await.parse().unwrap_or(20260);
+    let yaml = body.yaml.clone();
+    match shoes::start_proxy(&yaml).await {
+        Ok(handles) => {
+            *runtime.lock().unwrap() = Some(handles);
+            ApiResp::ok(serde_json::json!({ "message": format!("Proxy started on 127.0.0.1:{local_port}") }))
+        }
         Err(e) => ApiResp::<()>::err(format!("Failed to start: {e}")),
     }
 }
 
 #[post("/api/proxy/stop")]
-async fn proxy_stop(req: HttpRequest, process: Data<SharedProcess>) -> impl Responder {
+async fn proxy_stop(req: HttpRequest, runtime: Data<ShoesRuntime>) -> impl Responder {
     auth!(req);
-    let mut p = process.lock().unwrap();
-    match p.stop() {
-        Ok(_) => ApiResp::ok(serde_json::json!({ "message": "Shoes stopped." })),
-        Err(e) => ApiResp::<()>::err(e.to_string()),
+    let handles = runtime.lock().unwrap().take();
+    if let Some(handles) = handles {
+        for h in handles { h.abort(); }
+        info!("Proxy stopped");
+        ApiResp::ok(serde_json::json!({ "message": "Proxy stopped." }))
+    } else {
+        ApiResp::ok(serde_json::json!({ "message": "Proxy was not running." }))
     }
 }
 
@@ -699,28 +678,17 @@ async fn main() -> Result<()> {
     let pool = SqlitePool::connect(&db_url).await?;
     db_init(&pool).await?;
 
-    let shoes_binary = {
-        let from_env = env::var("KITEA_SHOES_BINARY").unwrap_or_default();
-        if from_env.is_empty() {
-            let from_db = db_get_setting(&pool, "shoes_binary").await;
-            if from_db.is_empty() { "shoes".to_string() } else { from_db }
-        } else { from_env }
-    };
-    let config_path = shoes_config_path();
-    info!("Shoes binary: {shoes_binary}");
-    info!("Shoes config: {}", config_path.display());
-
-    let process: SharedProcess = Arc::new(Mutex::new(ShoesProcess::new(shoes_binary, config_path)));
+    let runtime: ShoesRuntime = Arc::new(Mutex::new(None));
     let listen = env::var("KITEA_LISTEN").unwrap_or_else(|_| "0.0.0.0:2026".to_string());
     info!("KiteA listening on http://{listen}");
 
     let pool_data = Data::new(pool);
-    let process_data = Data::new(process);
+    let runtime_data = Data::new(runtime);
 
     HttpServer::new(move || {
         App::new()
             .app_data(pool_data.clone())
-            .app_data(process_data.clone())
+            .app_data(runtime_data.clone())
             .wrap(middleware::Logger::default())
             .wrap(Cors::default().allow_any_origin().allow_any_method().allow_any_header())
             // Auth
