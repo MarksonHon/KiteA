@@ -1,0 +1,13 @@
+# .cargo/config.toml
+# Windows x86_64-gnu 工具链需要 MinGW dlltool 在 PATH 中
+# 使用 Scoop 安装 MinGW 后执行：
+#   scoop install mingw-winlibs-llvm-ucrt    (或 mingw)
+# 然后将以下路径加入系统/用户 PATH：
+#   %USERPROFILE%\scoop\apps\mingw-winlibs-llvm-ucrt\current\bin
+#
+# 或使用 MSVC 工具链（推荐）：
+#   rustup default stable-x86_64-pc-windows-msvc
+
+[build]
+# 如需覆盖目标，取消注释：
+# target = "x86_64-pc-windows-msvc"

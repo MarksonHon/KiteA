@@ -1,0 +1,6 @@
+/target/
+kitea.db
+shoes_runtime.yaml
+*.db-shm
+*.db-wal
+.env
