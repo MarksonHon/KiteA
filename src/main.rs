@@ -108,12 +108,13 @@ struct User {
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 struct Node {
     id:         String,
-    name:       String,       // display name (ps / remark field)
-    protocol:   String,       // vmess | vless | shadowsocks | trojan | hysteria2 | tuic | socks5 | http
+    name:       String,
+    protocol:   String,
     server:     String,
     port:       i64,
-    uri:        String,       // original share URI (vmess://... vless://... etc.)
-    group:      String,       // subscription group name, empty for manual
+    uri:        String,
+    #[serde(rename = "group")]
+    group_name: String,
     enabled:    bool,
     created_at: String,
     updated_at: String,
@@ -406,7 +407,7 @@ async fn delete_user(req: HttpRequest, pool: Data<SqlitePool>, path: WebPath<Str
 async fn list_nodes(req: HttpRequest, pool: Data<SqlitePool>) -> impl Responder {
     auth!(req);
     let nodes: Vec<Node> = sqlx::query_as(
-        "SELECT id,name,protocol,server,port,uri,group_name as group,enabled,created_at,updated_at FROM nodes ORDER BY created_at"
+        "SELECT id,name,protocol,server,port,uri,group_name,enabled,created_at,updated_at FROM nodes ORDER BY created_at"
     ).fetch_all(pool.as_ref()).await.unwrap_or_default();
     ApiResp::ok(nodes)
 }

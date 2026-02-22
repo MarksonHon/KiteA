@@ -240,6 +240,44 @@ function parseTuic(uri) {
   }
 }
 
+// ── socks5 ────────────────────────────────────────────────────────────────────
+function parseSocks5(uri) {
+  const withoutScheme = uri.slice('socks5://'.length)
+  const hashIdx = withoutScheme.indexOf('#')
+  const name    = hashIdx >= 0 ? urlDecode(withoutScheme.slice(hashIdx + 1)) : 'socks5-node'
+  const main    = (hashIdx >= 0 ? withoutScheme.slice(0, hashIdx) : withoutScheme).split('?')[0]
+  let username = '', password = '', hostport = main
+  if (main.includes('@')) {
+    const atIdx = main.lastIndexOf('@')
+    const creds = main.slice(0, atIdx)
+    hostport = main.slice(atIdx + 1)
+    const ci = creds.indexOf(':')
+    username = ci >= 0 ? creds.slice(0, ci) : creds
+    password = ci >= 0 ? creds.slice(ci + 1) : ''
+  }
+  const ci = hostport.lastIndexOf(':')
+  return { protocol: 'socks5', name, server: hostport.slice(0, ci), port: parseInt(hostport.slice(ci + 1)) || 1080, username, password }
+}
+
+// ── http proxy ────────────────────────────────────────────────────────────────
+function parseHttpProxy(uri) {
+  const withoutScheme = uri.slice('http://'.length)
+  const hashIdx = withoutScheme.indexOf('#')
+  const name    = hashIdx >= 0 ? urlDecode(withoutScheme.slice(hashIdx + 1)) : 'http-node'
+  const main    = (hashIdx >= 0 ? withoutScheme.slice(0, hashIdx) : withoutScheme).split('?')[0]
+  let username = '', password = '', hostport = main
+  if (main.includes('@')) {
+    const atIdx = main.lastIndexOf('@')
+    const creds = main.slice(0, atIdx)
+    hostport = main.slice(atIdx + 1)
+    const ci = creds.indexOf(':')
+    username = ci >= 0 ? creds.slice(0, ci) : creds
+    password = ci >= 0 ? creds.slice(ci + 1) : ''
+  }
+  const ci = hostport.lastIndexOf(':')
+  return { protocol: 'http', name, server: hostport.slice(0, ci), port: parseInt(hostport.slice(ci + 1)) || 8080, username, password }
+}
+
 // ── public API ────────────────────────────────────────────────────────────────
 /**
  * Parse a single share URI and return a structured node object.
@@ -254,7 +292,81 @@ export function parseNodeUri(uri) {
   if (uri.startsWith('trojan://'))                      return parseTrojan(uri)
   if (uri.startsWith('hy2://') || uri.startsWith('hysteria2://')) return parseHysteria2(uri)
   if (uri.startsWith('tuic://'))                        return parseTuic(uri)
+  if (uri.startsWith('socks5://'))                      return parseSocks5(uri)
+  if (uri.startsWith('http://'))                        return parseHttpProxy(uri)
   throw new Error(`Unsupported URI scheme: ${uri.slice(0, 20)}...`)
+}
+
+/**
+ * Build a share URI from a manual-add form object.
+ * Returns a URI string compatible with parseNodeUri().
+ */
+export function buildUriFromForm(form) {
+  const name = encodeURIComponent(form.name || `${form.protocol}-${form.server}`)
+  switch (form.protocol) {
+    case 'vmess': {
+      const obj = {
+        v: '2', ps: form.name || form.server, add: form.server,
+        port: String(form.port), id: form.uuid, aid: '0',
+        scy: form.cipher || 'aes-128-gcm',
+        net: form.transport || 'tcp', type: 'none',
+        host: form.host || '', path: form.path || '/',
+        tls: form.tls || '',  sni: form.sni || '',
+      }
+      return 'vmess://' + btoa(encodeURIComponent(JSON.stringify(obj)).replace(/%([0-9A-F]{2})/g, (_, p) => String.fromCharCode('0x' + p)))
+    }
+    case 'vless': {
+      const p = new URLSearchParams()
+      p.set('type', form.transport || 'tcp')
+      p.set('security', form.security || 'tls')
+      if (form.sni)  p.set('sni',  form.sni)
+      if (form.flow) p.set('flow', form.flow)
+      if (form.pbk)  p.set('pbk',  form.pbk)
+      if (form.sid)  p.set('sid',  form.sid)
+      if (form.path) p.set('path', form.path)
+      if (form.host) p.set('host', form.host)
+      return `vless://${form.uuid}@${form.server}:${form.port}?${p}#${name}`
+    }
+    case 'shadowsocks': {
+      const userinfo = btoa(`${form.method}:${form.password}`)
+      return `ss://${userinfo}@${form.server}:${form.port}#${name}`
+    }
+    case 'trojan': {
+      const p = new URLSearchParams()
+      p.set('security', 'tls')
+      if (form.sni) p.set('sni', form.sni)
+      if (form.transport && form.transport !== 'tcp') {
+        p.set('type', form.transport)
+        if (form.path) p.set('path', form.path)
+        if (form.host) p.set('host', form.host)
+      }
+      return `trojan://${encodeURIComponent(form.password)}@${form.server}:${form.port}?${p}#${name}`
+    }
+    case 'hysteria2': {
+      const p = new URLSearchParams()
+      if (form.sni)      p.set('sni', form.sni)
+      if (form.insecure) p.set('insecure', '1')
+      if (form.obfs)     { p.set('obfs', form.obfs); if (form.obfsPassword) p.set('obfs-password', form.obfsPassword) }
+      return `hy2://${encodeURIComponent(form.password)}@${form.server}:${form.port}?${p}#${name}`
+    }
+    case 'tuic': {
+      const p = new URLSearchParams()
+      if (form.sni)  p.set('sni',  form.sni)
+      if (form.alpn) p.set('alpn', form.alpn)
+      if (form.insecure) p.set('insecure', '1')
+      return `tuic://${form.uuid}:${encodeURIComponent(form.password)}@${form.server}:${form.port}?${p}#${name}`
+    }
+    case 'socks5': {
+      if (form.username) return `socks5://${encodeURIComponent(form.username)}:${encodeURIComponent(form.password || '')}@${form.server}:${form.port}#${name}`
+      return `socks5://${form.server}:${form.port}#${name}`
+    }
+    case 'http': {
+      if (form.username) return `http://${encodeURIComponent(form.username)}:${encodeURIComponent(form.password || '')}@${form.server}:${form.port}#${name}`
+      return `http://${form.server}:${form.port}#${name}`
+    }
+    default:
+      throw new Error('Unsupported protocol: ' + form.protocol)
+  }
 }
 
 /**

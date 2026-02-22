@@ -182,6 +182,20 @@ function buildTuicChain(node) {
   return entry
 }
 
+function buildSocks5Chain(node) {
+  const proto = { type: 'socks5', udp_enabled: true }
+  if (node.username) proto.username = node.username
+  if (node.password) proto.password = node.password
+  return { address: `${node.server}:${node.port}`, protocol: proto }
+}
+
+function buildHttpChain(node) {
+  const proto = { type: 'http' }
+  if (node.username) proto.username = node.username
+  if (node.password) proto.password = node.password
+  return { address: `${node.server}:${node.port}`, protocol: proto }
+}
+
 function buildChain(node) {
   switch (node.protocol) {
     case 'vmess':       return buildVmessChain(node)
@@ -190,6 +204,8 @@ function buildChain(node) {
     case 'trojan':      return buildTrojanChain(node)
     case 'hysteria2':   return buildHysteria2Chain(node)
     case 'tuic':        return buildTuicChain(node)
+    case 'socks5':      return buildSocks5Chain(node)
+    case 'http':        return buildHttpChain(node)
     default:
       throw new Error(`Unsupported protocol: ${node.protocol}`)
   }
