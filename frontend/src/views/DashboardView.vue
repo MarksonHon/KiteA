@@ -18,6 +18,12 @@
         <div class="text-sm text-gray-500">监听地址 <span class="text-gray-900 dark:text-gray-100 font-mono">{{ status.listen || '—' }}</span></div>
         <div class="text-sm text-gray-500">当前节点 <span class="text-gray-900 dark:text-gray-100">{{ activeName || '（未选择）' }}</span></div>
         <div class="text-sm text-gray-500">本地端口 <span class="text-gray-900 dark:text-gray-100 font-mono">{{ settings.local_port || 1080 }}</span></div>
+        <div class="text-sm text-gray-500">
+          TUN 模式
+          <span :class="['ml-1 font-medium', status.tun_running ? 'text-green-600' : 'text-gray-400']">
+            {{ status.tun_running ? '● 运行中' : '○ 未启用' }}
+          </span>
+        </div>
       </div>
 
       <div class="flex flex-col gap-2">

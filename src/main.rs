@@ -25,6 +25,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
 };
+use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
 
 // ─── embedded frontend (built from frontend/) ─────────────────────────────────
@@ -235,6 +236,9 @@ macro_rules! auth {
 // ─── shoes runtime (integrated library) ──────────────────────────────────────
 type ShoesRuntime = Arc<Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>>;
 
+// ─── tun process (hev-socks5-tunnel subprocess) ───────────────────────────────
+type TunProcess = Arc<Mutex<Option<tokio::process::Child>>>;
+
 // ─── DB init ────────────────────────────────────────────────────────────────────
 async fn db_init(pool: &SqlitePool) -> Result<()> {
     sqlx::query(r#"
@@ -259,7 +263,11 @@ async fn db_init(pool: &SqlitePool) -> Result<()> {
         );
         INSERT OR IGNORE INTO settings (key, value) VALUES
             ('local_port', '20260'),
-            ('log_level',  'info');
+            ('log_level',  'info'),
+            ('tun_enabled', 'false'),
+            ('tun_binary',  'hev-socks5-tunnel'),
+            ('tun_name',    'tun0'),
+            ('tun_ipv4',    '198.18.0.1');
     "#).execute(pool).await?;
     Ok(())
 }
@@ -267,6 +275,11 @@ async fn db_init(pool: &SqlitePool) -> Result<()> {
 async fn db_get_setting(pool: &SqlitePool, key: &str) -> String {
     sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ?")
         .bind(key).fetch_optional(pool).await.ok().flatten().unwrap_or_default()
+}
+
+async fn db_get_setting_or<'a>(pool: &SqlitePool, key: &str, default: &'a str) -> String {
+    let v = db_get_setting(pool, key).await;
+    if v.is_empty() { default.to_string() } else { v }
 }
 
 // ─── API: auth ────────────────────────────────────────────────────────────────
@@ -500,7 +513,7 @@ async fn get_settings(req: HttpRequest, pool: Data<SqlitePool>) -> impl Responde
 #[post("/api/settings")]
 async fn save_setting(req: HttpRequest, pool: Data<SqlitePool>, body: Json<SaveSettingReq>) -> impl Responder {
     let _c = auth!(req, admin);
-    let allowed = ["local_port","log_level","dns_server"];
+    let allowed = ["local_port","log_level","dns_server","tun_enabled","tun_binary","tun_name","tun_ipv4"];
     if !allowed.contains(&body.key.as_str()) { return ApiResp::<()>::err("Unknown key"); }
     let _ = sqlx::query("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)")
         .bind(&body.key).bind(&body.value).execute(pool.as_ref()).await;
@@ -511,7 +524,7 @@ async fn save_setting(req: HttpRequest, pool: Data<SqlitePool>, body: Json<SaveS
 #[put("/api/settings")]
 async fn bulk_save_settings(req: HttpRequest, pool: Data<SqlitePool>, body: Json<serde_json::Value>) -> impl Responder {
     let _c = auth!(req, admin);
-    let allowed = ["local_port","dns_server","log_level"];
+    let allowed = ["local_port","dns_server","log_level","tun_enabled","tun_binary","tun_name","tun_ipv4"];
     if let Some(map) = body.as_object() {
         for (k, v) in map {
             if !allowed.contains(&k.as_str()) { continue; }
@@ -529,23 +542,34 @@ async fn bulk_save_settings(req: HttpRequest, pool: Data<SqlitePool>, body: Json
 
 // ─── API: proxy control ───────────────────────────────────────────────────────
 #[derive(Serialize)]
-struct StatusResp { running: bool, pid: Option<u32>, local_port: u16, node_count: usize }
+struct StatusResp { running: bool, pid: Option<u32>, local_port: u16, node_count: usize, tun_running: bool }
 
 #[get("/api/proxy/status")]
-async fn proxy_status(req: HttpRequest, pool: Data<SqlitePool>, runtime: Data<ShoesRuntime>) -> impl Responder {
+async fn proxy_status(req: HttpRequest, pool: Data<SqlitePool>, runtime: Data<ShoesRuntime>, tun: Data<TunProcess>) -> impl Responder {
     auth!(req);
     let running = {
         let guard = runtime.lock().unwrap();
         guard.as_ref().map(|h| h.iter().any(|jh| !jh.is_finished())).unwrap_or(false)
     };
+    let tun_running = {
+        let mut guard = tun.lock().unwrap();
+        if let Some(ref mut child) = *guard {
+            match child.try_wait() {
+                Ok(None) => true,   // still running
+                _ => { *guard = None; false }  // exited or error – clean up
+            }
+        } else {
+            false
+        }
+    };
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nodes WHERE enabled=1").fetch_one(pool.as_ref()).await.unwrap_or(0);
     let local_port: u16 = db_get_setting(pool.as_ref(), "local_port").await.parse().unwrap_or(20260);
-    ApiResp::ok(StatusResp { running, pid: None, local_port, node_count: count as usize })
+    ApiResp::ok(StatusResp { running, pid: None, local_port, node_count: count as usize, tun_running })
 }
 
 /// Frontend sends YAML; backend starts the integrated shoes proxy.
 #[post("/api/proxy/start")]
-async fn proxy_start(req: HttpRequest, pool: Data<SqlitePool>, runtime: Data<ShoesRuntime>, body: Json<StartProxyReq>) -> impl Responder {
+async fn proxy_start(req: HttpRequest, pool: Data<SqlitePool>, runtime: Data<ShoesRuntime>, tun: Data<TunProcess>, body: Json<StartProxyReq>) -> impl Responder {
     auth!(req);
     if body.yaml.trim().is_empty() { return ApiResp::<()>::err("YAML is empty"); }
     {
@@ -559,6 +583,25 @@ async fn proxy_start(req: HttpRequest, pool: Data<SqlitePool>, runtime: Data<Sho
     match shoes::start_proxy(&yaml).await {
         Ok(handles) => {
             *runtime.lock().unwrap() = Some(handles);
+            // Start hev-socks5-tunnel TUN process if enabled
+            if db_get_setting(pool.as_ref(), "tun_enabled").await == "true" {
+                let tun_binary = db_get_setting_or(pool.as_ref(), "tun_binary", "hev-socks5-tunnel").await;
+                let tun_name   = db_get_setting_or(pool.as_ref(), "tun_name",   "tun0").await;
+                let tun_ipv4   = db_get_setting_or(pool.as_ref(), "tun_ipv4",   "198.18.0.1").await;
+                let config_str = generate_tun_config(local_port, &tun_name, &tun_ipv4);
+                let config_path = default_db_path().join("tun_config.yaml");
+                if let Err(e) = std::fs::write(&config_path, &config_str) {
+                    warn!("Failed to write TUN config: {e}");
+                } else {
+                    match TokioCommand::new(&tun_binary).arg(&config_path).spawn() {
+                        Ok(child) => {
+                            *tun.lock().unwrap() = Some(child);
+                            info!("TUN process started ({})", tun_name);
+                        }
+                        Err(e) => warn!("Failed to start TUN process '{}': {e}", tun_binary),
+                    }
+                }
+            }
             ApiResp::ok(serde_json::json!({ "message": format!("Proxy started on 127.0.0.1:{local_port}") }))
         }
         Err(e) => ApiResp::<()>::err(format!("Failed to start: {e}")),
@@ -566,8 +609,14 @@ async fn proxy_start(req: HttpRequest, pool: Data<SqlitePool>, runtime: Data<Sho
 }
 
 #[post("/api/proxy/stop")]
-async fn proxy_stop(req: HttpRequest, runtime: Data<ShoesRuntime>) -> impl Responder {
+async fn proxy_stop(req: HttpRequest, runtime: Data<ShoesRuntime>, tun: Data<TunProcess>) -> impl Responder {
     auth!(req);
+    // Stop TUN process first
+    let tun_child = tun.lock().unwrap().take();
+    if let Some(mut child) = tun_child {
+        let _ = child.kill().await;
+        info!("TUN process stopped");
+    }
     let handles = runtime.lock().unwrap().take();
     if let Some(handles) = handles {
         for h in handles { h.abort(); }
@@ -662,6 +711,15 @@ async fn upsert_node_from_uri(pool: &SqlitePool, uri: &str, group: &str) -> Resu
     Ok(id)
 }
 
+// ─── tun config generator ─────────────────────────────────────────────────────
+/// Generate a hev-socks5-tunnel YAML configuration that routes TUN traffic
+/// through the local Shoes SOCKS5 listener at 127.0.0.1:<socks5_port>.
+fn generate_tun_config(socks5_port: u16, tun_name: &str, tun_ipv4: &str) -> String {
+    format!(
+        "tunnel:\n  name: {tun_name}\n  mtu: 8500\n  ipv4: {tun_ipv4}\n  route: default\n\nsocks5:\n  port: {socks5_port}\n  address: 127.0.0.1\n\nmisc:\n  task-stack-size: 20480\n  connect-timeout: 5000\n  read-write-timeout: 60000\n  log-file: stderr\n  log-level: warn\n"
+    )
+}
+
 // ─── main ─────────────────────────────────────────────────────────────────────
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -679,16 +737,19 @@ async fn main() -> Result<()> {
     db_init(&pool).await?;
 
     let runtime: ShoesRuntime = Arc::new(Mutex::new(None));
+    let tun_process: TunProcess = Arc::new(Mutex::new(None));
     let listen = env::var("KITEA_LISTEN").unwrap_or_else(|_| "0.0.0.0:2026".to_string());
     info!("KiteA listening on http://{listen}");
 
-    let pool_data = Data::new(pool);
+    let pool_data    = Data::new(pool);
     let runtime_data = Data::new(runtime);
+    let tun_data     = Data::new(tun_process);
 
     HttpServer::new(move || {
         App::new()
             .app_data(pool_data.clone())
             .app_data(runtime_data.clone())
+            .app_data(tun_data.clone())
             .wrap(middleware::Logger::default())
             .wrap(Cors::default().allow_any_origin().allow_any_method().allow_any_header())
             // Auth
