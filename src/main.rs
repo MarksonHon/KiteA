@@ -154,8 +154,9 @@ struct ImportNodeReq {
 /// Batch import from a subscription text (one URI per line, possibly base64)
 #[derive(Deserialize)]
 struct ImportSubscriptionReq {
-    name: String,
-    urls: Vec<String>,   // list of share URIs (already decoded by frontend)
+    name:  Option<String>,
+    uris:  Option<Vec<String>>,   // field name used by frontend
+    urls:  Option<Vec<String>>,   // kept for backward compat
     group: String,
 }
 
@@ -171,6 +172,12 @@ struct ChangePwdReq { old_password: String, new_password: String }
 
 #[derive(Deserialize)]
 struct SaveSettingReq { key: String, value: String }
+
+#[derive(Deserialize)]
+struct AddSubReq { name: String, url: String }
+
+#[derive(Deserialize)]
+struct PatchSubReq { last_update: Option<String> }
 
 /// The frontend generates the Shoes YAML and sends it here.
 #[derive(Deserialize)]
@@ -312,6 +319,29 @@ async fn register(pool: Data<SqlitePool>, body: Json<RegisterReq>) -> impl Respo
     ApiResp::ok(serde_json::json!({ "message": "Admin account created." }))
 }
 
+/// First-time setup: create admin + auto login (returns JWT)
+#[post("/api/auth/setup")]
+async fn setup_account(pool: Data<SqlitePool>, body: Json<RegisterReq>) -> impl Responder {
+    let username = body.username.trim();
+    if username.is_empty() || body.password.len() < 6 {
+        return ApiResp::<()>::err("用户名不能为空且密码至少 6 位");
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(pool.as_ref()).await.unwrap_or(0);
+    if count > 0 { return ApiResp::<()>::err("已完成初始化，请直接登录"); }
+    let pwd_hash = match hash(&body.password, DEFAULT_COST) { Ok(h) => h, Err(e) => return ApiResp::<()>::err(e.to_string()) };
+    let id  = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    if let Err(e) = sqlx::query("INSERT INTO users (id,username,password_hash,role,created_at) VALUES (?,?,?,?,?)")
+        .bind(&id).bind(username).bind(&pwd_hash).bind("admin").bind(&now).execute(pool.as_ref()).await
+    { return ApiResp::<()>::err(e.to_string()); }
+    let user = User { id, username: username.to_string(), password_hash: pwd_hash, role: "admin".to_string(), created_at: now };
+    match make_token(&user) {
+        Ok(t)  => ApiResp::ok(LoginResp { token: t, username: user.username, role: user.role }),
+        Err(e) => ApiResp::<()>::err(e.to_string()),
+    }
+}
+
 #[post("/api/auth/login")]
 async fn login(pool: Data<SqlitePool>, body: Json<LoginReq>) -> impl Responder {
     let user: Option<User> = sqlx::query_as("SELECT * FROM users WHERE username = ?")
@@ -396,13 +426,20 @@ async fn import_node(req: HttpRequest, pool: Data<SqlitePool>, body: Json<Import
 #[post("/api/nodes/import-subscription")]
 async fn import_subscription(req: HttpRequest, pool: Data<SqlitePool>, body: Json<ImportSubscriptionReq>) -> impl Responder {
     auth!(req);
+    let group = &body.group;
+    let name  = body.name.clone().unwrap_or_else(|| group.clone());
+    let uris  = body.uris.as_ref().or(body.urls.as_ref());
+    let uris  = match uris {
+        Some(v) => v.clone(),
+        None    => return ApiResp::<()>::err("Missing 'uris' field"),
+    };
     // Delete old nodes in this group to refresh
     let _ = sqlx::query("DELETE FROM nodes WHERE group_name=?")
-        .bind(&body.group).execute(pool.as_ref()).await;
+        .bind(group).execute(pool.as_ref()).await;
     let mut count = 0usize;
-    for uri in &body.urls {
+    for uri in &uris {
         if !uri.trim().is_empty() {
-            if upsert_node_from_uri(pool.as_ref(), uri.trim(), &body.group).await.is_ok() {
+            if upsert_node_from_uri(pool.as_ref(), uri.trim(), group).await.is_ok() {
                 count += 1;
             }
         }
@@ -411,7 +448,7 @@ async fn import_subscription(req: HttpRequest, pool: Data<SqlitePool>, body: Jso
     let now = Utc::now().to_rfc3339();
     let _ = sqlx::query(
         "INSERT OR REPLACE INTO subscriptions (id,name,url,last_update,created_at) VALUES (?,?,?,?,?)"
-    ).bind(Uuid::new_v4().to_string()).bind(&body.name).bind("").bind(&now).bind(&now)
+    ).bind(Uuid::new_v4().to_string()).bind(&name).bind("").bind(&now).bind(&now)
      .execute(pool.as_ref()).await;
     ApiResp::ok(serde_json::json!({ "imported": count }))
 }
@@ -447,11 +484,32 @@ async fn list_subscriptions(req: HttpRequest, pool: Data<SqlitePool>) -> impl Re
     ApiResp::ok(subs)
 }
 
+#[post("/api/subscriptions")]
+async fn add_subscription(req: HttpRequest, pool: Data<SqlitePool>, body: Json<AddSubReq>) -> impl Responder {
+    auth!(req);
+    let id  = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    if let Err(e) = sqlx::query("INSERT INTO subscriptions (id,name,url,last_update,created_at) VALUES (?,?,?,?,?)")
+        .bind(&id).bind(&body.name).bind(&body.url).bind("").bind(&now).execute(pool.as_ref()).await
+    { return ApiResp::<()>::err(e.to_string()); }
+    ApiResp::ok(serde_json::json!({ "id": id }))
+}
+
+#[put("/api/subscriptions/{id}")]
+async fn update_subscription(req: HttpRequest, pool: Data<SqlitePool>, path: WebPath<String>, body: Json<PatchSubReq>) -> impl Responder {
+    auth!(req);
+    let id = path.into_inner();
+    if let Some(lu) = &body.last_update {
+        let _ = sqlx::query("UPDATE subscriptions SET last_update=? WHERE id=?")
+            .bind(lu).bind(&id).execute(pool.as_ref()).await;
+    }
+    ApiResp::ok(serde_json::json!({ "message": "Updated" }))
+}
+
 #[delete("/api/subscriptions/{id}")]
 async fn delete_subscription(req: HttpRequest, pool: Data<SqlitePool>, path: WebPath<String>) -> impl Responder {
     auth!(req);
     let id = path.into_inner();
-    // Also remove all nodes in that subscription group (name matches)
     let sub: Option<Subscription> = sqlx::query_as("SELECT * FROM subscriptions WHERE id=?")
         .bind(&id).fetch_optional(pool.as_ref()).await.unwrap_or(None);
     if let Some(s) = sub {
@@ -473,10 +531,30 @@ async fn get_settings(req: HttpRequest, pool: Data<SqlitePool>) -> impl Responde
 #[post("/api/settings")]
 async fn save_setting(req: HttpRequest, pool: Data<SqlitePool>, body: Json<SaveSettingReq>) -> impl Responder {
     let _c = auth!(req, admin);
-    let allowed = ["shoes_binary","local_port","log_level"];
+    let allowed = ["shoes_binary","local_port","log_level","shoes_bin","dns_server"];
     if !allowed.contains(&body.key.as_str()) { return ApiResp::<()>::err("Unknown key"); }
     let _ = sqlx::query("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)")
         .bind(&body.key).bind(&body.value).execute(pool.as_ref()).await;
+    ApiResp::ok(serde_json::json!({ "message": "Saved" }))
+}
+
+/// Bulk-save settings (frontend sends a flat JSON object)
+#[put("/api/settings")]
+async fn bulk_save_settings(req: HttpRequest, pool: Data<SqlitePool>, body: Json<serde_json::Value>) -> impl Responder {
+    let _c = auth!(req, admin);
+    let allowed = ["shoes_binary","shoes_bin","local_port","dns_server","log_level"];
+    if let Some(map) = body.as_object() {
+        for (k, v) in map {
+            if !allowed.contains(&k.as_str()) { continue; }
+            let val = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                _ => continue,
+            };
+            let _ = sqlx::query("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)")
+                .bind(k).bind(&val).execute(pool.as_ref()).await;
+        }
+    }
     ApiResp::ok(serde_json::json!({ "message": "Saved" }))
 }
 
@@ -645,16 +723,17 @@ async fn main() -> Result<()> {
             .wrap(middleware::Logger::default())
             .wrap(Cors::default().allow_any_origin().allow_any_method().allow_any_header())
             // Auth
-            .service(register).service(login).service(change_password)
+            .service(register).service(setup_account).service(login).service(change_password)
             // Users
             .service(list_users).service(create_user).service(delete_user)
             // Nodes
             .service(list_nodes).service(import_node).service(import_subscription)
             .service(update_node).service(delete_node)
             // Subscriptions
-            .service(list_subscriptions).service(delete_subscription)
+            .service(list_subscriptions).service(add_subscription)
+            .service(update_subscription).service(delete_subscription)
             // Settings
-            .service(get_settings).service(save_setting)
+            .service(get_settings).service(save_setting).service(bulk_save_settings)
             // Proxy
             .service(proxy_status).service(proxy_start).service(proxy_stop)
             // Setup

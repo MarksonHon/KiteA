@@ -26,7 +26,8 @@ async function request(method, path, body) {
     throw new Error(json?.msg || `HTTP ${res.status}`)
   }
 
-  return json
+  // 返回 data 字段，使调用方可直接 res.token / res.nodes 等
+  return json.data !== undefined ? json.data : json
 }
 
 export const api = {

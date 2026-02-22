@@ -30,10 +30,11 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { api } from '@/utils/api'
+import { invalidateSetupCache } from '@/router/index'
 
 const router  = useRouter()
 const auth    = useAuthStore()
@@ -41,12 +42,22 @@ const loading = ref(false)
 const error   = ref('')
 const form    = ref({ username: '', password: '', confirm: '' })
 
+// 若用户已存在（直接访问 /setup），跳回登录页
+onMounted(async () => {
+  try {
+    const res = await fetch('/api/setup/needed')
+    const json = await res.json()
+    if (!json.data?.needed) router.replace('/login')
+  } catch {}
+})
+
 async function handleSetup() {
   error.value = ''
   if (form.value.password !== form.value.confirm) { error.value = '两次密码不一致'; return }
   loading.value = true
   try {
     const res = await api.post('/api/auth/setup', { username: form.value.username, password: form.value.password })
+    invalidateSetupCache()   // 让路由守卫下次重新检测
     auth.setAuth(res.token, res.username, res.role)
     router.push('/dashboard')
   } catch (e) {

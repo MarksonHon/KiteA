@@ -25,10 +25,46 @@ const router = createRouter({
   routes
 })
 
+// 缓存 setup 状态，避免每次导航都请求后端
+let setupNeededCache = null
+async function isSetupNeeded() {
+  if (setupNeededCache !== null) return setupNeededCache
+  try {
+    const res  = await fetch('/api/setup/needed')
+    const json = await res.json()
+    setupNeededCache = !!json.data?.needed
+  } catch {
+    setupNeededCache = false
+  }
+  return setupNeededCache
+}
+
+// 初始化完成后将缓存失效（setup 完成后下次导航会重新检测）
+export function invalidateSetupCache() {
+  setupNeededCache = null
+}
+
 router.beforeEach(async (to) => {
-  if (to.meta.public) return true
   const auth = useAuthStore()
-  if (!auth.token) return '/login'
+
+  // 访问 /setup：若已有用户则跳到登录页
+  if (to.name === 'Setup') {
+    const needed = await isSetupNeeded()
+    return needed ? true : '/login'
+  }
+
+  // 访问 /login：若尚无用户则跳到初始化页
+  if (to.name === 'Login') {
+    const needed = await isSetupNeeded()
+    return needed ? '/setup' : true
+  }
+
+  // 受保护路由：未登录时先判断是否需要初始化
+  if (!auth.token) {
+    const needed = await isSetupNeeded()
+    return needed ? '/setup' : '/login'
+  }
+
   return true
 })
 
