@@ -15,6 +15,7 @@
 | ▶ 代理控制 | 一键启动/停止 Shoes 子进程，实时状态展示 |
 | 📄 配置预览 | 查看自动生成的 Shoes YAML 配置内容 |
 | ⚙️ 系统设置 | 配置 Shoes 路径、本地监听端口、日志级别 |
+| 🌐 TUN 透明代理 | 集成 hev-socks5-tunnel，支持全局流量接管（TUN 入站） |
 | 🗄 数据持久化 | 使用 SQLite 存储账户、节点、设置信息 |
 
 ## 🔧 依赖的 Shoes 协议
@@ -100,6 +101,37 @@ cargo build --release
 ```
 
 参考 [Shoes CONFIG.md](https://github.com/cfal/shoes/blob/master/CONFIG.md) 了解完整配置格式。
+
+---
+
+### TUN 透明代理（hev-socks5-tunnel）
+
+KiteA 支持通过 [hev-socks5-tunnel](https://github.com/heiher/hev-socks5-tunnel) 启用 TUN 入站，将系统全局流量经由 TUN 虚拟网卡路由至 Shoes SOCKS5 本地监听端口，实现类 VPN 的透明代理模式。
+
+#### 工作原理
+
+```
+系统全局流量 → TUN 设备 (hev-socks5-tunnel) → Shoes SOCKS5 入口 → 远端代理节点
+```
+
+#### 启用步骤
+
+1. 安装 [hev-socks5-tunnel](https://github.com/heiher/hev-socks5-tunnel/releases)，确保可执行文件在 PATH 中或记录其完整路径。
+2. 以 **root 权限**（或具有 `CAP_NET_ADMIN` 权限）启动 KiteA。
+3. 在「**系统设置**」→「TUN 透明代理」部分：
+   - 勾选「启用 TUN 模式」
+   - 填写 `hev-socks5-tunnel` 可执行文件路径（留空则从 PATH 中查找）
+   - 按需修改 TUN 设备名称（默认 `tun0`）和 IPv4 地址（默认 `198.18.0.1`）
+4. 保存设置后，点击「**启动代理**」—— KiteA 将同时启动 Shoes 代理和 hev-socks5-tunnel。
+5. 停止代理时，两者会同时被终止。
+
+> **安全提示**：推荐不要以 root 运行整个 KiteA，而是仅向 `hev-socks5-tunnel` 可执行文件授予必要的网络权限：
+>
+> ```bash
+> sudo setcap 'cap_net_admin+ep' /usr/local/bin/hev-socks5-tunnel
+> ```
+>
+> 这样即可以普通用户身份运行 KiteA，hev-socks5-tunnel 仍可创建 TUN 设备。
 
 ---
 
